@@ -15,6 +15,10 @@ from transformers.models.bert.tokenization_bert import BasicTokenizer, whitespac
 from lxml import etree
 from markuplmft.data.tag_utils import tags_dict
 
+
+from PIL import Image
+from data.html_utils import simplify_dom_tree, rect_fixing, tag_pad_id
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,12 +60,16 @@ class TIEExample(object):
                  tok_to_orig_index=None,
                  orig_to_tok_index=None,
                  all_doc_tokens=None,
-                 tok_to_tags_index=None,
+                 all_doc_ttypes=None,
+                 all_doc_to_bbox=None,
+                 image=None,
+                 structure_input=None,
+                 structure_ttypes=None,
+                 structure_to_bbox=None,
+                 bbox=None,
+                 depth=None,
                  tags_to_tok_index=None,
-                 orig_tags=None,
-                 tag_depth=None,
-                 xpath_tag_map=None,
-                 xpath_subs_map=None,):
+                 orig_tags=None,):
         self.doc_tokens = doc_tokens
         self.qas_id = qas_id
         self.html_tree = html_tree
@@ -72,13 +80,18 @@ class TIEExample(object):
         self.end_position = end_position
         self.tok_to_orig_index = tok_to_orig_index
         self.orig_to_tok_index = orig_to_tok_index
-        self.all_doc_tokens = all_doc_tokens
-        self.tok_to_tags_index = tok_to_tags_index
         self.tags_to_tok_index = tags_to_tok_index
         self.orig_tags = orig_tags
-        self.tag_depth = tag_depth
-        self.xpath_tag_map = xpath_tag_map
-        self.xpath_subs_map = xpath_subs_map
+        self.all_doc_tokens = all_doc_tokens
+        self.all_doc_ttypes = all_doc_ttypes
+        self.all_doc_to_bbox = all_doc_to_bbox
+        self.image = image
+        self.structure_input = structure_input
+        self.structure_ttypes = structure_ttypes
+        self.structure_to_bbox = structure_to_bbox
+        self.bbox = bbox
+        self.depth = depth
+
 
     def __str__(self):
         return self.__repr__()
@@ -113,7 +126,6 @@ class InputFeatures(object):
                                         it belongs to.
         tag_to_token_index (list[list[int]]): the starting and ending position (in all_doc_tokens) of each tag.
         app_tags (list[str]): the tid of all tags appearing in the feature.
-        depth (list[int]): the depth in the DOM tree of all tags in the feature.
         base_index (int): the starting position of the content in Structure Encoder.
         is_impossible (bool): whether the answer is fully in the doc span.
         xpath_tags_seq (list): the tag name ids of the xpath of each tag.
@@ -131,18 +143,19 @@ class InputFeatures(object):
                  input_ids,
                  input_mask,
                  segment_ids,
+                 tag_ids,
+                 input_to_bboxes,
+                 bboxes,
+                 depths,
+                 images,
                  paragraph_len,
                  answer_tid=None,
                  start_position=None,
                  end_position=None,
-                 token_to_tag_index=None,
                  tag_to_token_index=None,
                  app_tags=None,
-                 depth=None,
                  base_index=None,
-                 is_impossible=None,
-                 xpath_tags_seq=None,
-                 xpath_subs_seq=None,):
+                 is_impossible=None,):
         self.unique_id = unique_id
         self.page_id = page_id
         self.example_index = example_index
@@ -153,18 +166,19 @@ class InputFeatures(object):
         self.input_ids = input_ids
         self.input_mask = input_mask
         self.segment_ids = segment_ids
+        self.tag_ids = tag_ids
+        self.input_to_bboxes = input_to_bboxes
+        self.bboxes = bboxes
+        self.depths = depths
+        self.images = images
         self.paragraph_len = paragraph_len
         self.answer_tid = answer_tid
         self.start_position = start_position
         self.end_position = end_position
-        self.token_to_tag_index = token_to_tag_index
         self.tag_to_token_index = tag_to_token_index
         self.app_tags = app_tags
-        self.depth = depth
         self.base_index = base_index
         self.is_impossible = is_impossible
-        self.xpath_tags_seq = xpath_tags_seq
-        self.xpath_subs_seq = xpath_subs_seq
 
     def to_json(self):
         return json.dumps(self.__dict__)
@@ -180,6 +194,42 @@ def html_escape(html):
     html = html.replace('&gt;', '>')
     html = html.replace('&nbsp;', ' ')
     return html
+
+
+def preprocess_html_file_with_rect(html_filename, rect_filename, image_filename):
+    image = Image.open(image_filename)
+    image = image.convert('RGB')
+    with open(rect_filename, "r", encoding='utf-8') as f:
+        tag_bbox = json.load(f)
+
+    x_offset = tag_bbox['2']['rect']['x']
+    y_offset = tag_bbox['2']['rect']['y']
+    for rect in tag_bbox.values():
+        rect['rect']['x'] -= x_offset
+        rect['rect']['y'] -= y_offset
+
+    with open(html_filename) as f:
+        orig_html_string = f.read()
+
+    orig_html = bs4.BeautifulSoup(orig_html_string, 'lxml')
+
+    html = bs4.BeautifulSoup(orig_html_string, 'lxml')
+    img_width, img_height = image.size
+    simplify_dom_tree(html, tag_bbox, img_width, img_height, less_decompose=True)
+    if len(html.find_all()) <= 5 or not html.get_text(strip=True):
+        html = orig_html
+
+    rect_fixing(html, tag_bbox, img_width, img_height, orig_html=orig_html)
+
+    final_tag = list(html.children)[0]
+    final_tag.name = 'html'
+
+    all_tids = [tag['tid'] for tag in html.find_all()]
+    new_tag_bbox = {k: [v['rect']['x'], v['rect']['y'], v['rect']['x'] + v['rect']['width'], v['rect']['y'] + v['rect']['height']]
+                    for k, v in tag_bbox.items() if k in all_tids}
+    new_tag_bbox[final_tag['tid']] = [0, 0, img_width, img_height]
+
+    return image, str(final_tag), new_tag_bbox
 
 
 def get_xpath4tokens(html_fn: str, unique_tids: set):
@@ -260,7 +310,7 @@ def get_xpath_and_treeid4tokens(html_code, unique_tids, max_depth):
     return xpath_tag_map, xpath_subs_map
 
 
-def read_examples(input_file, root_dir, is_training, tokenizer, base_mode, max_depth=50, simplify=False):
+def read_examples(input_file, root_dir, is_training, tokenizer, base_mode, feature_extractor, max_depth=50, simplify=False):
     r"""
     pre-process the data in json format into SRC Examples.
 
@@ -341,6 +391,13 @@ def read_examples(input_file, root_dir, is_training, tokenizer, base_mode, max_d
             n_char += len(l[i]) + 1
         return n_char
 
+    def get_html_tag_num(h):
+        tag_num = 0
+        for element in h.descendants:
+            if type(element) == bs4.element.Tag:
+                tag_num += 1
+        return tag_num + 2
+
     def word_to_tag_from_text(tokens, h):
         cnt, path = -1, []
         w2t, t2w, tags = [], [], []
@@ -382,10 +439,10 @@ def read_examples(input_file, root_dir, is_training, tokenizer, base_mode, max_d
                 content = ' '.join(list(element.strings)).split()
                 t_w.append({'start': len(w_t), 'len': len(content)})
                 tags.append('<' + element.name + '>')
-                tags_tids.append(element['tid'])
+                tags_tids.append(int(element['tid']))
             elif type(element) == bs4.element.NavigableString and element.strip():
                 text = element.split()
-                tid = element.parent['tid']
+                tid = int(element.parent['tid'])
                 ind = tags_tids.index(tid)
                 for _ in text:
                     w_t.append(ind)
@@ -395,10 +452,12 @@ def read_examples(input_file, root_dir, is_training, tokenizer, base_mode, max_d
         w_t.append(len(tags) + 1)
         tags.append('<no>')
         tags.append('<yes>')
-        return w_t, t_w, tags
+        tags_tids.append(-2)
+        tags_tids.append(-1)
+        return w_t, t_w, tags, tags_tids
 
     def subtoken_tag_offset(html, s_tok, tok_s):
-        w_t, t_w, tags = word_tag_offset(html)
+        w_t, t_w, tags, tags_tids = word_tag_offset(html)
         s_t, t_s = [], []
         unique_tids = set(range(len(tags)))
         for i in range(len(s_tok)):
@@ -409,7 +468,7 @@ def read_examples(input_file, root_dir, is_training, tokenizer, base_mode, max_d
             except IndexError:
                 assert i == t_w[-1]
                 t_s.append({'start': tok_s[i['start']], 'end': len(s_tok) - 1})
-        return s_t, t_s, tags, unique_tids
+        return s_t, t_s, tags_tids, unique_tids
 
     def calculate_depth(html_code):
         def _calc_depth(tag, depth):
@@ -433,52 +492,102 @@ def read_examples(input_file, root_dir, is_training, tokenizer, base_mode, max_d
             # Generate Doc Tokens
             page_id = website["page_id"]
             curr_dir = osp.join(root_dir, domain, page_id[0:2], 'processed_data')
-            html_file = open(osp.join(curr_dir, page_id + '.html')).read()
-            html_code = bs(html_file)
 
-            raw_text_list, tag_num = html_to_text_list(html_code)
-            page_text = ' '.join(raw_text_list)
+            html_filename = osp.join(curr_dir, page_id + '.html')
+            rect_filename = osp.join(curr_dir, page_id + '.json')
+            image_filename = osp.join(curr_dir, page_id + '.png')
+
+            image, simplified_html_string, tag_bbox = \
+                preprocess_html_file_with_rect(html_filename, rect_filename, image_filename)
+
+            feature = feature_extractor(image, simplified_html_string, tag_bbox, return_tids=True,
+                                        return_depth=True)
+
+            image = feature['pixel_values'][0]
+            structure_input = feature['structure_inputs'][0]
+            structure_ttype = feature['structure_ttypes'][0]
+            structure2bbox = feature['structure2bboxes'][0]
+
+            content_input = feature['content_inputs'][0]
+            content_ttype = feature['content_ttypes'][0]
+            content2bbox = feature['content2bboxes'][0]
+
+            bbox = feature['bboxes'][0]
+            depth = feature['bbox_depths'][0]
+            bbox_tid = feature['bbox_tids'][0]
+
+            orig_html_file = open(html_filename).read()
+            orig_html = bs(orig_html_file, "html.parser")
+
+            html_code = bs(simplified_html_string, "html.parser")
+
+            char_to_span_idx = []
+            page_text = ''
+            for i, text_span in enumerate(content_input):
+                if page_text != "":
+                    page_text += ' '
+                    char_to_span_idx += [i - 1]
+                page_text += text_span
+                char_to_span_idx += [i] * len(text_span)
+
             doc_tokens = []
+            doc_ttypes = []
+            doc_to_tag_index = []
             char_to_word_offset = []
+            doc_to_bbox = []
+
+            page_text = ' '.join(content_input)
             prev_is_whitespace = True
-            for c in page_text:
+            for i, c in enumerate(page_text):
                 if is_whitespace(c):
                     prev_is_whitespace = True
                 else:
                     if prev_is_whitespace:
                         doc_tokens.append(c)
+                        span_idx = char_to_span_idx[i]
+                        tid = int(bbox_tid[content2bbox[span_idx]])
+                        doc_to_tag_index.append(tid)
+                        doc_ttypes.append(content_ttype[span_idx])
+                        doc_to_bbox.append(content2bbox[span_idx])
                     else:
                         doc_tokens[-1] += c
                     prev_is_whitespace = False
                 char_to_word_offset.append(len(doc_tokens) - 1)
+
+            tag_num = get_html_tag_num(orig_html)
+
             doc_tokens.append('no')
             char_to_word_offset.append(len(doc_tokens) - 1)
+            doc_ttypes.append(122)
+            doc_to_tag_index.append(tag_num - 2)
+            doc_to_bbox.append(structure2bbox[0])
+
             doc_tokens.append('yes')
             char_to_word_offset.append(len(doc_tokens) - 1)
+            doc_ttypes.append(122)
+            doc_to_tag_index.append(tag_num - 1)
+            doc_to_bbox.append(structure2bbox[0])
 
-            if base_mode != 'markuplm':
-                real_text, tag_list = html_to_text(bs(html_file))
-                all_tag_list = all_tag_list | tag_list
-                char_to_word_offset = adjust_offset(char_to_word_offset, real_text)
-                doc_tokens = real_text.split()
-                doc_tokens.append('no')
-                doc_tokens.append('yes')
-                doc_tokens = [i for i in doc_tokens if i]
-                assert len(doc_tokens) == char_to_word_offset[-1] + 1, (len(doc_tokens), char_to_word_offset[-1])
-            else:
-                tag_list = []
+            tag_list = []
+
+            assert len(doc_tokens) == char_to_word_offset[-1] + 1, (len(doc_tokens), char_to_word_offset[-1])
 
             if simplify:
                 for qa in website["qas"]:
                     qas_id = qa["id"]
-                    tag_depth = calculate_depth(html_code)
-                    example = TIEExample(doc_tokens=doc_tokens, qas_id=qas_id, html_tree=html_code, tag_depth=tag_depth)
+                    example = TIEExample(doc_tokens=doc_tokens, qas_id=qas_id, html_tree=html_code)
                     examples.append(example)
             else:
                 # Tokenize all doc tokens
                 tok_to_orig_index = []
                 orig_to_tok_index = []
                 all_doc_tokens = []
+                all_doc_ttypes = []
+                all_doc_to_bbox = []
+                tok_to_tags_index = []
+                tags_to_tok_index = []
+                orig_tags = []
+
                 for (i, token) in enumerate(doc_tokens):
                     orig_to_tok_index.append(len(all_doc_tokens))
                     if token in tag_list:
@@ -488,32 +597,26 @@ def read_examples(input_file, root_dir, is_training, tokenizer, base_mode, max_d
                     for sub_token in sub_tokens:
                         tok_to_orig_index.append(i)
                         all_doc_tokens.append(sub_token)
+                        all_doc_ttypes.append(doc_ttypes[i])
+                        all_doc_to_bbox.append(doc_to_bbox[i])
+                        tok_to_tags_index.append(doc_to_tag_index[i])
 
-                # Generate extra information for features
-                if base_mode != 'markuplm':
-                    tok_to_tags_index, tags_to_tok_index, orig_tags = word_to_tag_from_text(all_doc_tokens,
-                                                                                            bs(html_file))
-                    xpath_tag_map, xpath_subs_map = None, None
-                else:
-                    tok_to_tags_index, tags_to_tok_index, orig_tags, unique_tids = subtoken_tag_offset(
-                                                                                            html_code,
-                                                                                            tok_to_orig_index,
-                                                                                            orig_to_tok_index)
-                    xpath_tag_map, xpath_subs_map = get_xpath_and_treeid4tokens(html_code,
-                                                                                unique_tids,
-                                                                                max_depth=max_depth)
+                tok_to_tags_index, tags_to_tok_index, orig_tags, unique_tids = subtoken_tag_offset(
+                                                                                        html_code,
+                                                                                        tok_to_orig_index,
+                                                                                        orig_to_tok_index)
 
-                assert tok_to_tags_index[-1] == tag_num - 1, (tok_to_tags_index[-1], tag_num - 1)
+                # assert tok_to_tags_index[-1] == tag_num - 1, (tok_to_tags_index[-1], tag_num - 1)
 
                 # Process each qas, which is mainly calculate the answer position
                 for qa in website["qas"]:
                     qas_id = qa["id"]
                     question_text = qa["question"]
-                    answer_tid = None
+                    answer_tag_idx = None
                     start_position = None
                     end_position = None
                     orig_answer_text = None
-                    tag_depth = calculate_depth(html_code)
+                    # tag_depth = calculate_depth(html_code)
 
                     if is_training:
                         if len(qa["answers"]) != 1:
@@ -521,17 +624,17 @@ def read_examples(input_file, root_dir, is_training, tokenizer, base_mode, max_d
                         answer = qa["answers"][0]
                         orig_answer_text = answer["text"]
                         if answer["element_id"] == -1:
-                            answer_tid = len(orig_tags) - 2 + answer["answer_start"]
+                            answer_tag_idx = len(orig_tags) - 2 + answer["answer_start"]
                             num_char = len(char_to_word_offset) - 2
                         else:
-                            num_text, answer_tid = e_id_to_t_id(answer["element_id"], html_code)
-                            num_char = calc_num_from_raw_text_list(num_text, raw_text_list)
+                            num_text, answer_tag_idx = e_id_to_t_id(answer["element_id"], html_code)
+                            num_char = calc_num_from_raw_text_list(num_text, content_input)
                         answer_offset = num_char + answer["answer_start"]
                         answer_length = len(orig_answer_text) if answer["element_id"] != -1 else 1
                         start_position = char_to_word_offset[answer_offset]
                         end_position = char_to_word_offset[answer_offset + answer_length - 1]
-                        node_text = doc_tokens[tok_to_orig_index[tags_to_tok_index[answer_tid]['start']]:
-                                               tok_to_orig_index[tags_to_tok_index[answer_tid]['end']] + 1]
+                        node_text = doc_tokens[tok_to_orig_index[tags_to_tok_index[answer_tag_idx]['start']]:
+                                               tok_to_orig_index[tags_to_tok_index[answer_tag_idx]['end']] + 1]
                         node_text = ' '.join([s for s in node_text if s[0] != '<' or s[-1] != '>'])
                         cleaned_answer_text = " ".join(whitespace_tokenize(orig_answer_text))
                         if node_text.find(cleaned_answer_text) == -1:
@@ -551,18 +654,22 @@ def read_examples(input_file, root_dir, is_training, tokenizer, base_mode, max_d
                         html_tree=html_code,
                         question_text=question_text,
                         orig_answer_text=orig_answer_text,
-                        answer_tid=answer_tid,
+                        answer_tid=orig_tags[answer_tag_idx] if answer_tag_idx is not None else None,
                         start_position=start_position,
                         end_position=end_position,
                         tok_to_orig_index=tok_to_orig_index,
                         orig_to_tok_index=orig_to_tok_index,
                         all_doc_tokens=all_doc_tokens,
-                        tok_to_tags_index=tok_to_tags_index,
+                        all_doc_ttypes=all_doc_ttypes,
+                        all_doc_to_bbox=all_doc_to_bbox,
+                        image=image,
+                        structure_input=structure_input,
+                        structure_ttypes=structure_ttype,
+                        structure_to_bbox=structure2bbox,
+                        bbox=bbox,
+                        depth=depth,
                         tags_to_tok_index=tags_to_tok_index,
                         orig_tags=orig_tags,
-                        tag_depth=tag_depth,
-                        xpath_tag_map=xpath_tag_map,
-                        xpath_subs_map=xpath_subs_map,
                     )
                     examples.append(example)
 
@@ -570,7 +677,7 @@ def read_examples(input_file, root_dir, is_training, tokenizer, base_mode, max_d
 
 
 def convert_examples_to_features(examples, tokenizer, max_seq_length, max_tag_length,
-                                 doc_stride, max_query_length, is_training,
+                                 doc_stride, max_query_length, max_structure_length, is_training,
                                  cls_token='[CLS]', sep_token='[SEP]', pad_token=0,
                                  sequence_a_segment_id=0, sequence_b_segment_id=1,
                                  cls_token_segment_id=0, pad_token_segment_id=0,
@@ -609,8 +716,19 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, max_tag_le
 
     for (example_index, example) in enumerate(tqdm(examples)):
 
-        xpath_tag_map = example.xpath_tag_map
-        xpath_subs_map = example.xpath_subs_map
+        structure_tokens = example.structure_input
+        structure_ttype = example.structure_ttypes
+        structure_to_bbox = example.structure_to_bbox
+        if len(structure_tokens) > max_structure_length:
+            structure_tokens = structure_tokens[0:max_structure_length]
+            structure_ttype = structure_ttype[0:max_structure_length]
+            structure_to_bbox = structure_to_bbox[0:max_structure_length]
+
+        bboxes = example.bbox
+        depths = example.depth
+        bboxes += [[0, 0, 0, 0]] * (max_seq_length - len(bboxes))
+        depths += [0] * (max_seq_length - len(depths))
+        image = example.image
 
         query_tokens = tokenizer.tokenize(example.question_text)
         if len(query_tokens) > max_query_length:
@@ -631,7 +749,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, max_tag_le
                 example.orig_answer_text)
 
         # The -3 accounts for [CLS], [SEP] and [SEP]
-        max_tokens_for_doc = max_seq_length - len(query_tokens) - 3
+        max_tokens_for_doc = max_seq_length - len(query_tokens) - len(structure_tokens) - 5
 
         # We can have documents that are longer than the maximum sequence length.
         # To deal with this we do a sliding window approach, where we take chunks
@@ -644,6 +762,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, max_tag_le
             length = len(example.all_doc_tokens) - start_offset
             if length > max_tokens_for_doc:
                 length = max_tokens_for_doc
+            assert length > 0, (max_tokens_for_doc, len(example.all_doc_tokens), start_offset)
             doc_spans.append(_DocSpan(start=start_offset, length=length))
             if start_offset + length == len(example.all_doc_tokens):
                 break
@@ -653,32 +772,47 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, max_tag_le
             tokens = []
             token_to_orig_map = {}
             token_is_max_context = {}
-            segment_ids = []
+
+            tag_ids = []
+            input_to_bboxes = []
+
             tag_to_token_index = []
-            token_to_tag_index = []
-            depth = []
 
             # CLS
-            tokens.append(cls_token)
-            segment_ids.append(cls_token_segment_id)
+            tokens.append(tokenizer.cls_token)
             tag_to_token_index.append([0, 0])
-            token_to_tag_index.append(-1)
-            depth.append(0)
+            tag_ids.append(56)
+            input_to_bboxes.append(structure_to_bbox[0])
+
+            for i in range(len(structure_tokens)):
+                tag_to_token_index.append([len(tokens) + i, len(tokens) + i])
+            tokens += structure_tokens
+            tag_ids += structure_ttype
+            input_to_bboxes += structure_to_bbox
+
+            # SEP token
+            tokens += [tokenizer.sep_token] * 2
+            tag_ids += [56] * 2
+            input_to_bboxes += [structure_to_bbox[0]] * 2
+            tag_to_token_index.append([len(tokens) - 2, len(tokens) - 2])
+            tag_to_token_index.append([len(tokens) - 1, len(tokens) - 1])
+
+            segment_ids = [0] * len(tokens)
 
             # Query
             for i in range(len(query_tokens)):
                 tag_to_token_index.append([len(tokens) + i, len(tokens) + i])
-                token_to_tag_index.append(-1)
             tokens += query_tokens
-            segment_ids += [sequence_a_segment_id] * len(query_tokens)
-            depth += [0] * len(query_tokens)
+            segment_ids += [1] * len(query_tokens)
+            tag_ids += [56] * len(query_tokens)
+            input_to_bboxes += [structure_to_bbox[0]] * len(query_tokens)
 
             # SEP token
-            tokens.append(sep_token)
-            segment_ids.append(sequence_a_segment_id)
+            tokens.append(tokenizer.sep_token)
             tag_to_token_index.append([len(tokens) - 1, len(tokens) - 1])
-            token_to_tag_index.append(-1)
-            depth.append(0)
+            segment_ids.append(1)
+            tag_ids.append(56)
+            input_to_bboxes.append(structure_to_bbox[0])
 
             # Paragraph
             app_tags = []
@@ -695,49 +829,47 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, max_tag_le
                     start = max(start, doc_span.start) - doc_span.start + len(tokens)
                     end = min(end, doc_span.start + doc_span.length - 1) - doc_span.start + len(tokens)
                     tag_to_token_index.append([start, end])
-                    app_tags.append(i)
-            for ind in app_tags:
-                depth.append(example.tag_depth[ind])
-            if len(app_tags) > max_tag_length - len(query_tokens) - 3:
+                    app_tags.append(example.orig_tags[i])
+
+            if len(app_tags) > max_tag_length - len(query_tokens) - len(structure_tokens) - 5:
                 raise ValueError('Max tag length is not big enough to contain {}'.format(len(app_tags)))
             for i in range(doc_span.length):
                 split_token_index = doc_span.start + i
                 token_to_orig_map[len(tokens)] = example.tok_to_orig_index[split_token_index]
-                token_to_tag_index.append(example.tok_to_tags_index[split_token_index])
                 is_max_context = _check_is_max_context(doc_spans, doc_span_index,
                                                        split_token_index)
                 token_is_max_context[len(tokens)] = is_max_context
                 tokens.append(example.all_doc_tokens[split_token_index])
-                segment_ids.append(sequence_b_segment_id)
+                segment_ids.append(1)
+                tag_ids.append(example.all_doc_ttypes[split_token_index])
+                input_to_bboxes.append(example.all_doc_to_bbox[split_token_index])
+
             paragraph_len = doc_span.length
 
             # SEP token
             tokens.append(sep_token)
-            segment_ids.append(sequence_b_segment_id)
+            segment_ids.append(1)
             tag_to_token_index.append([len(tokens) - 1, len(tokens) - 1])
-            token_to_tag_index.append(-1)
-            depth.append(0)
+            tag_ids.append(56)
+            input_to_bboxes.append(structure_to_bbox[0])
 
             input_ids = tokenizer.convert_tokens_to_ids(tokens)
 
             # mask generating
-            base = len(query_tokens) + 2
+            base = len(query_tokens) + len(structure_tokens) + 4
             input_mask = [1] * len(input_ids)
 
             # Zero-pad up to the sequence length.
             while len(input_ids) < max_seq_length:
                 input_ids.append(pad_token)
                 input_mask.append(0)
-                segment_ids.append(pad_token_segment_id)
-                token_to_tag_index.append(-1)
-            while len(depth) < max_tag_length:
-                depth.append(0)
+                segment_ids.append(0)
+                tag_ids.append(tag_pad_id)
+                input_to_bboxes.append(max_seq_length - 1)
 
             assert len(input_ids) == max_seq_length
             assert len(input_mask) == max_seq_length
             assert len(segment_ids) == max_seq_length
-            assert len(token_to_tag_index) == max_seq_length
-            assert len(depth) == max_tag_length
 
             span_is_impossible = False
             answer_tid = None
@@ -755,18 +887,11 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, max_tag_le
                     span_is_impossible = True
                 else:
                     assert tok_answer_tid in app_tags
-                    offset = len(query_tokens) + 2
+                    offset = len(query_tokens) + len(structure_tokens) + 4
                     answer_tid = app_tags.index(tok_answer_tid) + offset
                     start_position = tok_start_position - doc_start + offset
                     end_position = tok_end_position - doc_start + offset
 
-            pad_x_tag_seq = [216] * max_depth
-            pad_x_subs_seq = [1001] * max_depth
-            if xpath_tag_map is not None:
-                xpath_tags_seq = [xpath_tag_map.get(tid, pad_x_tag_seq) for tid in token_to_tag_index]  # ok
-                xpath_subs_seq = [xpath_subs_map.get(tid, pad_x_subs_seq) for tid in token_to_tag_index]  # ok
-            else:
-                xpath_tags_seq, xpath_subs_seq = None, None
             features.append(
                 InputFeatures(
                     unique_id=unique_id,
@@ -779,18 +904,19 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length, max_tag_le
                     input_ids=input_ids,
                     input_mask=input_mask,
                     segment_ids=segment_ids,
+                    tag_ids=tag_ids,
+                    input_to_bboxes=input_to_bboxes,
+                    bboxes=bboxes,
+                    depths=depths,
+                    images=image,
                     paragraph_len=paragraph_len,
                     answer_tid=answer_tid,
                     start_position=start_position,
                     end_position=end_position,
-                    token_to_tag_index=token_to_tag_index,
                     tag_to_token_index=tag_to_token_index,
                     app_tags=app_tags,
-                    depth=depth,
                     base_index=base,
                     is_impossible=span_is_impossible,
-                    xpath_tags_seq=xpath_tags_seq,
-                    xpath_subs_seq=xpath_subs_seq,
                 ))
             unique_id += 1
 
@@ -880,8 +1006,9 @@ def write_tag_predictions(all_examples, all_features, all_results, n_best_tag_si
                                                     feature.base_index + len(feature.app_tags))]
             if model_name != 'markuplm':
                 possible_values = [ind for ind in possible_values
-                                   if feature.tag_to_token_index[ind][1] - feature.tag_to_token_index[ind][0] > 1 or
-                                   example.orig_tags[feature.app_tags[ind - feature.base_index]] in ['<no>', '<yes>']]
+                                   if feature.tag_to_token_index[ind][1]
+                                   - feature.tag_to_token_index[ind][0] > 1 or
+                                   example.orig_tags.index(feature.app_tags[ind - feature.base_index]) in ['<no>', '<yes>']]
             tag_indexes = _get_best_tags(result.tag_logits, n_best_tag_size, possible_values)
             for ind in range(len(tag_indexes)):
                 tag_index = tag_indexes[ind]

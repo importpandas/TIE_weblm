@@ -61,6 +61,13 @@ class PiecedDataset(_BaseDataset):
         all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
         all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
         all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
+
+        all_tag_ids = torch.tensor([f.tag_ids for f in features], dtype=torch.long)
+        all_input_to_bboxes = torch.tensor([f.input_to_bboxes for f in features], dtype=torch.long).clip_(0, 511)
+        all_bboxes = torch.tensor([f.bboxes[:512] for f in features], dtype=torch.float32)
+        all_depths = torch.tensor([f.depths[:512] for f in features], dtype=torch.int64)
+        all_images = torch.tensor([f.images for f in features], dtype=torch.float32)
+
         all_app_tags = [f.app_tags for f in features]
         all_example_index = [f.example_index for f in features]
         all_base_index = [f.base_index for f in features]
@@ -77,6 +84,7 @@ class PiecedDataset(_BaseDataset):
             all_feature_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
             self.dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids, all_feature_index,
                                         all_xpath_tags_seq, all_xpath_subs_seq,
+                                        all_tag_ids, all_input_to_bboxes, all_bboxes, all_depths, all_images,
                                         gat_mask=(all_app_tags, all_example_index, self.all_html_trees),
                                         base_index=all_base_index, tag2tok=all_tag_to_token,
                                         shape=(self.args.max_tag_length, self.args.max_seq_length),
@@ -91,6 +99,7 @@ class PiecedDataset(_BaseDataset):
                 all_start_positions, all_end_positions = None, None
             self.dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids, all_answer_tid,
                                         all_xpath_tags_seq, all_xpath_subs_seq, all_start_positions, all_end_positions,
+                                        all_tag_ids, all_input_to_bboxes, all_bboxes, all_depths, all_images,
                                         gat_mask=(all_app_tags, all_example_index, self.all_html_trees),
                                         base_index=all_base_index, tag2tok=all_tag_to_token,
                                         shape=(self.args.max_tag_length, self.args.max_seq_length),

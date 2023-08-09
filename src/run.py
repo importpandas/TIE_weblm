@@ -23,6 +23,11 @@ from transformers import (
 )
 from markuplmft.models.markuplm import MarkupLMConfig, MarkupLMTokenizer, MarkupLMForQuestionAnswering
 
+from weblm_model.configuration_weblm import WebLMConfig
+from weblm_model.tokenization_weblm_fast import WebLMTokenizerFast
+from weblm_model.modeling_weblm import WebLMForQuestionAnswering
+from weblm_model.feature_extraction_weblm import WebLMFeatureExtractor
+
 from model import TIEConfig, TIE
 from dataset import StrucDataset, PiecedDataset
 from utils import read_examples, convert_examples_to_features, RawResult, RawTagResult,\
@@ -50,7 +55,7 @@ def to_list(tensor):
     return tensor.detach().cpu().tolist()
 
 
-def train(args, train_dataset, model, tokenizer):
+def train(args, train_dataset, model, tokenizer, feature_extractor=None):
     r"""
     Train the model
     """
@@ -60,10 +65,13 @@ def train(args, train_dataset, model, tokenizer):
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     if args.separate_read is not None:
         assert args.local_rank == -1
-        train_sampler = SequentialSampler(train_dataset)
+        if args.local_rank == -1:
+            train_sampler = SequentialSampler(train_dataset)
+        else:
+            train_sampler = DistributedSampler(train_dataset, shuffle=False)
     else:
         train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4)
 
     if args.max_steps > 0:
         t_total = args.max_steps
@@ -94,8 +102,8 @@ def train(args, train_dataset, model, tokenizer):
 
     # Distributed training (should be after apex fp16 initialization)
     if args.local_rank != -1:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
-                                                          output_device=args.local_rank,
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[0],
+                                                          output_device=0,
                                                           find_unused_parameters=True)
 
     # Train!
@@ -156,6 +164,14 @@ def train(args, train_dataset, model, tokenizer):
                     'start_positions': batch[6],
                     'end_positions': batch[7],
                 })
+            if args.model_type == 'weblm':
+                inputs.update({
+                    'tag_ids': batch[4],
+                    'input_to_bboxes': batch[5],
+                    'bboxes': batch[6],
+                    'depths': batch[7],
+                    'images': batch[8],
+                })
             outputs = model(**inputs)
             loss = outputs[0]
             if args.merge_weight is not None:
@@ -188,7 +204,7 @@ def train(args, train_dataset, model, tokenizer):
                     # Log metrics
                     if args.local_rank == -1 and args.evaluate_during_training:
                         # Only evaluate when single GPU otherwise metrics may not average well
-                        results = evaluate(args, model, tokenizer, prefix=str(global_step), write_pred=False)
+                        results = evaluate(args, model, tokenizer, feature_extractor=feature_extractor, prefix=str(global_step), write_pred=False)
                         for key, value in results.items():
                             tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
                     tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
@@ -225,11 +241,12 @@ def train(args, train_dataset, model, tokenizer):
     return global_step, tr_loss / global_step
 
 
-def evaluate(args, model, tokenizer, prefix="", write_pred=True):
+def evaluate(args, model, tokenizer, feature_extractor=None, prefix="", write_pred=True):
     r"""
     Evaluate the model
     """
-    dataset, examples, features = load_and_cache_examples(args, tokenizer, evaluate=True, split=args.evaluate_split)
+    dataset, examples, features = load_and_cache_examples(args, tokenizer, feature_extractor=feature_extractor,
+                                                          evaluate=True, split=args.evaluate_split)
 
     if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir)
@@ -237,7 +254,7 @@ def evaluate(args, model, tokenizer, prefix="", write_pred=True):
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
     # Note that DistributedSampler samples randomly
     eval_sampler = SequentialSampler(dataset) if args.local_rank == -1 else DistributedSampler(dataset)
-    eval_dataloader = DataLoader(dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+    eval_dataloader = DataLoader(dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=4)
 
     # multi-gpu evaluate
     if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
@@ -273,6 +290,14 @@ def evaluate(args, model, tokenizer, prefix="", write_pred=True):
                 del inputs['token_type_ids']
             if args.model_type == 'roberta':
                 del inputs['token_type_ids']
+            if args.model_type == 'weblm':
+                inputs.update({
+                    'tag_ids': batch[4],
+                    'input_to_bboxes': batch[5],
+                    'bboxes': batch[6],
+                    'depths': batch[7],
+                    'images': batch[8],
+                })
             feature_indices = batch[3]
             outputs = model(**inputs)
 
@@ -340,7 +365,7 @@ def evaluate(args, model, tokenizer, prefix="", write_pred=True):
     return results
 
 
-def load_and_cache_examples(args, tokenizer, evaluate=False, split='train'):
+def load_and_cache_examples(args, tokenizer, feature_extractor=None, evaluate=False, split='train'):
     r"""
     Load and process the raw data.
     """
@@ -350,10 +375,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, split='train'):
 
     # Load data features from cache or dataset file
     input_file = args.predict_file if evaluate else args.train_file
-    cached_features_file = os.path.join(os.path.dirname(input_file), 'cached', 'cached_{}_{}_{}'.format(
-        split,
-        list(filter(None, args.model_name_or_path.split('/'))).pop().split('_')[0],
-        str(args.max_seq_length)))
+    cached_features_file = os.path.join(os.path.dirname(input_file), 'cached', f'cached_{split}_weblm_512')
 
     if os.path.exists(cached_features_file) and not args.overwrite_cache:
         logger.info("Loading features from cached file %s", cached_features_file)
@@ -365,6 +387,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, split='train'):
         examples, tag_list = read_examples(input_file=input_file,
                                            root_dir=args.root_dir,
                                            is_training=not evaluate,
+                                           feature_extractor=feature_extractor,
                                            tokenizer=tokenizer,
                                            base_mode=args.model_type,
                                            simplify=False if evaluate else True)
@@ -380,6 +403,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, split='train'):
             examples, tag_list = read_examples(input_file=input_file,
                                                root_dir=args.root_dir,
                                                is_training=not evaluate,
+                                               feature_extractor=feature_extractor,
                                                tokenizer=tokenizer,
                                                base_mode=args.model_type,
                                                simplify=True)
@@ -390,6 +414,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, split='train'):
         examples, _ = read_examples(input_file=input_file,
                                     root_dir=args.root_dir,
                                     is_training=not evaluate,
+                                    feature_extractor=feature_extractor,
                                     tokenizer=tokenizer,
                                     base_mode=args.model_type,
                                     simplify=False)
@@ -399,6 +424,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, split='train'):
                                                 max_seq_length=args.max_seq_length,
                                                 doc_stride=args.doc_stride,
                                                 max_query_length=args.max_query_length,
+                                                max_structure_length=args.max_structure_length,
                                                 max_tag_length=args.max_tag_length,
                                                 is_training=not evaluate,
                                                 cls_token=tokenizer.cls_token,
@@ -410,7 +436,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, split='train'):
             if args.separate_read is not None and not evaluate:
                 random.shuffle(features)
                 total = len(features)
-                num = ((total // 64) // args.separate_read) * 64
+                num = ((total // 2) // args.separate_read) * 2
                 for i in range(args.separate_read - 1):
                     torch.save(features[i * num:(i + 1) * num], cached_features_file + '_sub_{}'.format(i + 1))
                 torch.save(features[(args.separate_read - 1) * num:],
@@ -426,15 +452,25 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, split='train'):
         return dataset
 
     # Convert to Tensors and build dataset
+
+    all_html_trees = [e.html_tree for e in examples]
+
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
     all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
     all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
+
+    all_tag_ids = torch.tensor([f.tag_ids for f in features], dtype=torch.long)
+    all_input_to_bboxes = torch.tensor([f.input_to_bboxes for f in features], dtype=torch.long).clip_(0, 511)
+    all_bboxes = torch.tensor([f.bboxes[:512] for f in features], dtype=torch.float32)
+    all_depths = torch.tensor([f.depths[:512] for f in features], dtype=torch.int64)
+    all_images = torch.tensor([f.images for f in features], dtype=torch.float32)
+
     all_app_tags = [f.app_tags for f in features]
     all_example_index = [f.example_index for f in features]
-    all_html_trees = [e.html_tree for e in examples]
     all_base_index = [f.base_index for f in features]
     all_tag_to_token = [f.tag_to_token_index for f in features]
     all_page_id = [f.page_id for f in features]
+
     if args.model_type == 'markuplm':
         all_xpath_tags_seq = torch.tensor([f.xpath_tags_seq for f in features], dtype=torch.long)
         all_xpath_subs_seq = torch.tensor([f.xpath_subs_seq for f in features], dtype=torch.long)
@@ -445,6 +481,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, split='train'):
         all_feature_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
         dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids, all_feature_index,
                                all_xpath_tags_seq, all_xpath_subs_seq,
+                               all_tag_ids, all_input_to_bboxes, all_bboxes, all_depths, all_images,
                                gat_mask=(all_app_tags, all_example_index, all_html_trees), base_index=all_base_index,
                                tag2tok=all_tag_to_token, shape=(args.max_tag_length, args.max_seq_length),
                                training=False, page_id=all_page_id, mask_method=args.mask_method,
@@ -458,6 +495,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, split='train'):
             all_start_positions, all_end_positions = None, None
         dataset = StrucDataset(all_input_ids, all_input_mask, all_segment_ids, all_answer_tid,
                                all_xpath_tags_seq, all_xpath_subs_seq, all_start_positions, all_end_positions,
+                               all_tag_ids, all_input_to_bboxes, all_bboxes, all_depths, all_images,
                                gat_mask=(all_app_tags, all_example_index, all_html_trees), base_index=all_base_index,
                                tag2tok=all_tag_to_token, shape=(args.max_tag_length, args.max_seq_length),
                                training=True, page_id=all_page_id, mask_method=args.mask_method,
@@ -495,9 +533,12 @@ def main():
     parser.add_argument("--do_lower_case", action='store_true',
                         help="Set this flag if you are using an uncased model.")
 
-    parser.add_argument("--max_seq_length", default=384, type=int,
+    parser.add_argument("--max_seq_length", default=512, type=int,
                         help="The maximum total input sequence length after WordPiece tokenization. Sequences "
                              "longer than this will be truncated, and sequences shorter than this will be padded.")
+    parser.add_argument("--max_structure_length", default=250, type=int,
+                        help="The maximum length of an answer that can be generated. This is needed because the start "
+                             "and end predictions are not conditioned on one another.")
     parser.add_argument("--doc_stride", default=128, type=int,
                         help="When splitting up a long document into chunks, how much stride to take between chunks.")
     parser.add_argument("--max_query_length", default=64, type=int,
@@ -627,6 +668,7 @@ def main():
         device = torch.device("cuda", args.local_rank)
         torch.distributed.init_process_group(backend='nccl')
         args.n_gpu = 1
+        args.local_rank = torch.distributed.get_rank()
     args.device = device
 
     # Setup logging
@@ -651,6 +693,12 @@ def main():
         tokenizer = MarkupLMTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name
                                                       else args.model_name_or_path,
                                                       do_lower_case=args.do_lower_case, cache_dir=args.cache_dir)
+    elif args.model_type == 'weblm':
+        config = WebLMConfig.from_pretrained(args.model_name_or_path, cache_dir=args.cache_dir)
+        config.num_labels = 2
+        tokenizer = WebLMTokenizerFast.from_pretrained(args.model_name_or_path, use_fast=True, cache_dir=args.cache_dir)
+        feature_extractor = WebLMFeatureExtractor(keep_aspect_ratio=False,
+                                                  size=224)
     else:
         config = AutoConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path,
                                             cache_dir=args.cache_dir)
@@ -663,13 +711,22 @@ def main():
             model = MarkupLMForQuestionAnswering.from_pretrained(args.model_name_or_path,
                                                                  from_tf=bool('.ckpt' in args.model_name_or_path),
                                                                  config=config, cache_dir=args.cache_dir)
+        elif args.model_type == 'weblm':
+            model = WebLMForQuestionAnswering.from_pretrained(
+                args.model_name_or_path,
+                from_tf=False,
+                config=config,
+                cache_dir=args.cache_dir,
+                revision="main",
+                use_auth_token=None
+            )
         else:
             model = AutoModelForQuestionAnswering.from_pretrained(args.model_name_or_path,
                                                                   from_tf=bool('.ckpt' in args.model_name_or_path),
                                                                   config=config, cache_dir=args.cache_dir)
     else:
         tie_config = TIEConfig(args, **config.__dict__)
-        model = TIE(tie_config, init_plm=True)
+        model = TIE(tie_config, ptm_config=config, init_plm=True)
 
     if args.local_rank == 0:
         torch.distributed.barrier()
@@ -691,12 +748,13 @@ def main():
 
     # Training
     if args.do_train:
-        train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, split='train')
+        train_dataset = load_and_cache_examples(args, tokenizer, feature_extractor=feature_extractor,
+                                                evaluate=False, split='train')
         if model.config.vocab_size != len(tokenizer):
             model.resize_token_embeddings(len(tokenizer))
         tokenizer.save_pretrained(args.output_dir)
         model.to(args.device)
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        global_step, tr_loss = train(args, train_dataset, model, tokenizer, feature_extractor=feature_extractor)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
         # Save the trained model and the tokenizer
@@ -720,7 +778,7 @@ def main():
         if args.provided_tag_pred is not None:
             logger.info("Evaluate the PLM provided with tags: %s", args.model_name_or_path)
             model.to(args.device)
-            result = evaluate(args, model, tokenizer)
+            result = evaluate(args, model, tokenizer, feature_extractor=feature_extractor)
             results.update(result)
         else:
             if args.eval_all_checkpoints:
@@ -740,6 +798,12 @@ def main():
                 tokenizer_dir = args.output_dir
             if args.model_type == 'markuplm':
                 tokenizer = MarkupLMTokenizer.from_pretrained(tokenizer_dir, do_lower_case=args.do_lower_case)
+            elif args.model_type == 'weblm':
+                tokenizer = WebLMTokenizerFast.from_pretrained(tokenizer_dir, do_lower_case=args.do_lower_case)
+                feature_extractor = WebLMFeatureExtractor(keep_aspect_ratio=False,
+                                                          size=224)
+                config = WebLMConfig.from_pretrained(args.model_name_or_path, cache_dir=args.cache_dir)
+                config.num_labels = 2
             else:
                 tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, do_lower_case=args.do_lower_case)
             if model.config.vocab_size != len(tokenizer):
@@ -757,11 +821,12 @@ def main():
                 if global_step and args.eval_to_checkpoint and int(global_step) >= args.eval_to_checkpoint:
                     continue
                 tie_config = TIEConfig.from_pretrained(checkpoint)
-                model = TIE.from_pretrained(checkpoint, config=tie_config)
+                model = TIE.from_pretrained(checkpoint, config=tie_config, ptm_config=config)
                 model.to(args.device)
 
                 # Evaluate
-                result = evaluate(args, model, tokenizer, prefix=global_step)
+                result = evaluate(args, model, tokenizer, feature_extractor=feature_extractor,
+                                  prefix=global_step)
 
                 result = dict((k + ('_{}'.format(global_step) if global_step else ''), v) for k, v in result.items())
                 results.update(result)

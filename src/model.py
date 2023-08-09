@@ -8,6 +8,7 @@ from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertEnco
 from transformers import PretrainedConfig, AutoConfig, AutoModelForQuestionAnswering
 
 from markuplmft import MarkupLMForQuestionAnswering
+from weblm_model.modeling_weblm import WebLMForQuestionAnswering
 
 
 class TIEEncoder(BertEncoder):
@@ -90,6 +91,8 @@ class TIEConfig(PretrainedConfig):
                  **kwargs):
         self.hidden_size = kwargs.pop("hidden_size", None)
         self.max_position_embeddings = kwargs.pop("max_position_embeddings", None)
+        # if ptm_config is not None:
+        #     self.ptm_config = ptm_config
         super().__init__(**kwargs)
         if args is not None:
             self.ptm_model_type = args.model_type
@@ -141,7 +144,7 @@ def convert_mask_to_reality(mask, dtype=torch.float):
 class TIE(BertPreTrainedModel):
     base_model_prefix = "ptm"
 
-    def __init__(self, config: TIEConfig, init_plm=False):
+    def __init__(self, config: TIEConfig, ptm_config=None, init_plm=False):
         super(TIE, self).__init__(config)
         self.base_type = getattr(config, 'ptm_model_type', 'markuplm')
         self.mask_method = config.mask_method
@@ -151,12 +154,16 @@ class TIE(BertPreTrainedModel):
         if init_plm:
             if self.base_type == 'markuplm':
                 self.ptm = MarkupLMForQuestionAnswering.from_pretrained(config.name_or_path, config=config)
+            elif self.base_type == 'weblm':
+                self.ptm = WebLMForQuestionAnswering.from_pretrained(config.name_or_path, config=ptm_config)
             else:
                 ptm_config = AutoConfig.from_pretrained(config.ptm_name_or_path)
                 self.ptm = AutoModelForQuestionAnswering.from_pretrained(config.ptm_name_or_path, config=ptm_config)
         else:
             if self.base_type == 'markuplm':
                 self.ptm = MarkupLMForQuestionAnswering(config)
+            elif self.base_type == 'weblm':
+                self.ptm = WebLMForQuestionAnswering(ptm_config)
             else:
                 ptm_config = AutoConfig.from_pretrained(config.ptm_name_or_path)
                 ptm_config.vocab_size = config.vocab_size
@@ -174,6 +181,11 @@ class TIE(BertPreTrainedModel):
     def forward(
             self,
             input_ids,
+            tag_ids=None,
+            bboxes=None,
+            input_to_bboxes=None,
+            images=None,
+            depths=None,
             attention_mask=None,
             dom_mask=None,
             spa_mask=None,
@@ -199,6 +211,22 @@ class TIE(BertPreTrainedModel):
                 inputs_embeds=inputs_embeds,
                 xpath_tags_seq=xpath_tags_seq,
                 xpath_subs_seq=xpath_subs_seq,
+            )
+            sequence_output = outputs[0]
+            outputs = outputs[2:]
+        elif self.base_type == 'weblm':
+            outputs = self.ptm(
+                input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                tag_ids=tag_ids,
+                bboxes=bboxes,
+                input_to_bboxes=input_to_bboxes,
+                images=images,
+                depths=depths,
             )
             sequence_output = outputs[0]
             outputs = outputs[2:]
